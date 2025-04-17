@@ -3,7 +3,7 @@ USER root
 WORKDIR /home/choreouser
 COPY / /home/choreouser/
 RUN apt update && apt upgrade -y
-RUN npm i ws express basic-auth dns2
+RUN npm i ws express@4.21.2 basic-auth dns2
 RUN apt install curl -y
 RUN apt install wget -y
 RUN apt install python3 -y
