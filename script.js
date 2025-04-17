@@ -4,272 +4,370 @@ const express = require('express');
 const http = require('http');
 const https = require('https');
 const auth = require("basic-auth");
+const { URL } = require('url');
 const { exec } = require('child_process');
-const { URL } = require('url'); // Diperlukan untuk parsing URL
 
+// --- Konfigurasi ---
 const username = process.env.WEB_USERNAME || "admin";
 const password = process.env.WEB_PASSWORD || "password";
-
-// Pastikan UUID diambil dari environment atau default, dan tanpa tanda hubung
-const uuid = (process.env.UUID || '37a0bd7c-8b9f-4693-8916-bd1e2da0a817').replace(/-/g, '');
-const expectedPath = `/${uuid}`; // Path yang diharapkan untuk koneksi WebSocket
-
+// Pastikan UUID environment variable ada dan valid, atau gunakan default
+const V_UUID = (process.env.UUID || '37a0bd7c-8b9f-4693-8916-bd1e2da0a817').replace(/-/g, '');
 const port = process.env.PORT || 7860;
 const DOH_SERVER = process.env.DOH_SERVER || 'https://dns.nextdns.io/7df33f';
+// Tentukan path WebSocket yang diharapkan. Klien HARUS terhubung ke path ini.
+const WS_PATH = process.env.WS_PATH || '/';
+// --- Akhir Konfigurasi ---
 
-// Jalankan agent.sh di background
+
+// Jalankan proses agent.sh di background
 (async () => {
   exec('./agent.sh &', (error, stdout, stderr) => {
     if (error) {
-      console.error(`Exec error: ${error.message}`);
+      process.stderr.write(`Error starting agent.sh: ${error.message}\n`);
       return;
     }
     if (stderr) {
-      // Mungkin ada output normal di stderr, jadi tidak selalu error
-      // console.error(`Exec stderr: ${stderr}`);
+      process.stderr.write(`agent.sh stderr: ${stderr}\n`);
+      // Mungkin tidak perlu return di sini, tergantung apakah stderr adalah error fatal
     }
-    // console.log(`Exec stdout: ${stdout}`); // Hapus log stdout normal
+    // Tidak menampilkan stdout normalnya
   });
 })();
 
 const app = express();
 const server = http.createServer(app);
 
-// Inisialisasi WebSocket Server tanpa server HTTP (noServer: true)
-// Kita akan menangani upgrade secara manual
+// Pisahkan WebSocket Server dari HTTP Server untuk penanganan upgrade eksplisit
 const wss = new WebSocket.Server({ noServer: true });
 
+// Fungsi resolver DNS-over-HTTPS
 async function resolveHostViaDoH(domain) {
   return new Promise((resolve, reject) => {
+    // Validasi domain sederhana
+    if (!domain || typeof domain !== 'string' || domain.length === 0) {
+       return reject(new Error('Invalid domain for DoH resolution'));
+    }
     const url = `${DOH_SERVER}?name=${encodeURIComponent(domain)}&type=A`;
     https.get(url, {
-      headers: { 'Accept': 'application/dns-json' }
+      headers: { 'Accept': 'application/dns-json' },
+      rejectUnauthorized: false // Tambahkan jika DOH server menggunakan cert self-signed
     }, (res) => {
       let data = '';
+      if (res.statusCode !== 200) {
+        res.resume(); // Konsumsi data untuk membebaskan memori
+        return reject(new Error(`DoH query failed with status code: ${res.statusCode}`));
+      }
       res.on('data', (chunk) => data += chunk);
       res.on('end', () => {
         try {
           const response = JSON.parse(data);
-          if (response.Answer && response.Answer.length > 0) {
-            const answer = response.Answer.find(a => a.type === 1); // Type 1 for A record
-            if (answer) return resolve(answer.data);
+          // Periksa Status dan Answer (format standar DoH JSON)
+          if (response.Status === 0 && response.Answer && response.Answer.length > 0) {
+            // Cari record A (type 1)
+            const answer = response.Answer.find(a => a.type === 1);
+            if (answer && answer.data) {
+              return resolve(answer.data); // Kembalikan IP address
+            }
           }
+          // Jika tidak ada jawaban atau status error
           reject(new Error('No valid A record found in DoH response'));
         } catch (e) {
           reject(new Error(`Failed to parse DoH response: ${e.message}`));
         }
       });
-    }).on('error', (err) => reject(new Error(`DoH request failed: ${err.message}`)));
+    }).on('error', (err) => reject(new Error(`DoH request error: ${err.message}`)));
   });
 }
 
-function parseHost(msg, offset) {
+// Fungsi parsing host (asumsi format protokol |/|)
+function parseHostInfo(msg, offset) {
   const ATYP = msg.readUInt8(offset++);
   let host;
-  let hostLen = 0;
+  let hostLength = 0; // Untuk menghitung panjang total bagian host
+
   if (ATYP === 1) { // IPv4
-    hostLen = 4;
-    host = msg.slice(offset, offset + hostLen).join('.');
+    hostLength = 4;
+    host = msg.slice(offset, offset + hostLength).join('.');
   } else if (ATYP === 3) { // Domain Name
-    hostLen = msg.readUInt8(offset++);
-    host = msg.slice(offset, offset + hostLen).toString('utf8');
-  } else if (ATYP === 4) { // IPv6
-    hostLen = 16;
-    const ipBytes = msg.slice(offset, offset + hostLen);
+    hostLength = msg.readUInt8(offset++); // Panjang domain
+    host = msg.slice(offset, offset + hostLength).toString('utf8');
+  } else if (ATYP === 2) { // IPv6 (Revisi: Biasanya ATYP=3 untuk Domain, ATYP=2 untuk IPv6 di |. Sesuaikan jika protokol Anda berbeda)
+    hostLength = 16;
+    const ipBytes = msg.slice(offset, offset + hostLength);
     const segments = [];
     for (let j = 0; j < 16; j += 2) {
       segments.push(ipBytes.readUInt16BE(j).toString(16));
     }
-    host = segments.join(':').replace(/:(0:)+/, '::').replace(/:{3,}/, '::'); // Basic IPv6 compression
+    host = segments.join(':').replace(/:(0:)+/, '::').replace(/::+/, '::'); // Format IPv6
   } else {
-    // Dalam protokol |/VMESS, ATYP=2 adalah IPv6, ATYP=3 adalah Domain
-    // Jika ATYP=2 adalah Domain di implementasi asli Anda, sesuaikan kembali:
-    // } else if (ATYP === 2) { // Domain Name (jika implementasi Anda begini)
-    //     hostLen = msg.readUInt8(offset++);
-    //     host = msg.slice(offset, offset + hostLen).toString('utf8');
-    // } else if (ATYP === 3) { // IPv6 (jika implementasi Anda begini)
-    //     hostLen = 16; ... (kode IPv6 di atas) ...
     throw new Error("Unsupported address type: " + ATYP);
   }
-  offset += hostLen;
-  return { ATYP, host, offset };
+  offset += hostLength; // Maju setelah membaca host
+  const port = msg.readUInt16BE(offset);
+  offset += 2; // Maju setelah membaca port
+
+  return { ATYP, host, port, offset };
 }
 
-// Tangani koneksi WebSocket SETELAH validasi UUID berhasil
-wss.on('connection', (ws) => {
+
+wss.on('connection', (ws, req) => {
   ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
+  let initialClientDataProcessed = false;
+  let remoteSocket = null;
+  let streamDuplex = null;
 
-  const interval = setInterval(() => {
-    if (!ws.isAlive) return ws.terminate();
-    ws.isAlive = false;
-    ws.ping();
-  }, 30000);
-
-  ws.on('close', () => {
-    clearInterval(interval);
+  ws.on('pong', () => {
+    ws.isAlive = true;
   });
 
-  ws.once('message', async (msg) => {
-    try {
-       // | Header structure (simplified assumption):
-       // 1 byte version, 16 bytes UUID, 1 byte addon length, ...
-       // Need to find the start of the address correctly.
-       // The original code's offset logic might be specific to a protocol.
-       // Let's assume the target address info starts after the UUID and any addons.
-       // This part HIGHLY depends on the exact protocol format the client sends.
-       // The original offset calculation: `msg.readUInt8(17) + 19` seems arbitrary without context.
-       // Let's try a common | approach: Addr starts after Version (1) + UUID (16) + AddonLen (1) + Addons (?)
-       // Assuming addon length is 0 for simplicity here. Adjust if needed.
-       let offset = 1 + 16 + 1; // Start after version, UUID, addon length byte
-       // If addon length byte (at index 17) is non-zero, adjust offset:
-       const addonLen = msg.readUInt8(17);
-       offset += addonLen; // Add actual addon length
-
-       // Now read the target port (2 bytes)
-       const targetPort = msg.readUInt16BE(offset);
-       offset += 2;
-
-       // Parse the host address (ATYP + Address)
-       let parsedHost;
-       try {
-           parsedHost = parseHost(msg, offset);
-       } catch (parseError) {
-           console.error('Failed to parse target address:', parseError.message);
-           ws.close();
-           return;
-       }
-       let { ATYP, host } = parsedHost;
-       offset = parsedHost.offset; // Update offset based on parsed host length
-
-       let targetIP = host;
-       // Resolve domain using DoH if ATYP indicates domain name (ATYP=3)
-       if (ATYP === 3) { // ATYP 3 is typically Domain Name
-         try {
-           targetIP = await resolveHostViaDoH(host);
-         } catch (err) {
-           console.error(`DoH resolution failed for ${host}:`, err.message);
-           ws.close();
-           return;
-         }
-       }
-
-       // | response: Version (1 byte), Addon Length (1 byte, usually 0)
-       ws.send(Buffer.from([msg[0], 0])); // Assuming request version msg[0], response addon length 0
-
-       const duplex = WebSocket.createWebSocketStream(ws);
-       const socket = net.connect({ host: targetIP, port: targetPort }, () => {
-         // Write the rest of the initial packet (payload)
-         socket.write(msg.slice(offset));
-         // Start piping data
-         duplex.pipe(socket).pipe(duplex);
-       });
-
-       socket.on('error', (err) => {
-         // console.error(`Target socket error for ${host}:${targetPort}:`, err.message); // Kurangi log
-         socket.destroy();
-         ws.close();
-       });
-       duplex.on('error', (err) => {
-         // console.error('WebSocket stream duplex error:', err.message); // Kurangi log
-         socket.destroy(); // ws already closed/closing if duplex errors
-       });
-       socket.on('end', () => {
-           ws.close(); // Close WebSocket if target closes connection
-       });
-       ws.on('close', () => {
-           socket.destroy(); // Ensure target socket is destroyed when WebSocket closes
-       });
-
-    } catch (err) {
-      console.error('Error processing first message:', err);
-      ws.close();
+  const heartbeatInterval = setInterval(() => {
+    if (!ws.isAlive) {
+      // process.stderr.write('WebSocket client timeout, terminating connection.\n');
+      ws.terminate();
+      return;
     }
+    ws.isAlive = false;
+    ws.ping();
+  }, 30000); // 30 detik ping interval
+
+  ws.on('message', async (message) => {
+    try {
+      // Proses pesan pertama untuk setup koneksi backend
+      if (!initialClientDataProcessed) {
+        initialClientDataProcessed = true;
+
+        // --- Validasi UUID ---
+        // Asumsi UUID ada di 16 byte pertama (sesuai |/|)
+        if (message.length < 18) { // Minimal UUID(16) + Versi(1) + AddonsLen(1)
+            throw new Error("Received message too short for initial handshake.");
+        }
+        const clientUUID = message.slice(0, 16).toString('hex');
+        if (clientUUID !== V_UUID) {
+          // process.stderr.write(`UUID mismatch. Expected: ${V_UUID}, Received: ${clientUUID}. Closing connection.\n`);
+          ws.close(1008, "Invalid UUID"); // Kirim kode close policy violation
+          return;
+        }
+        // --- Akhir Validasi UUID ---
+
+
+        // Lanjutkan parsing sisa header |/| (contoh sederhana)
+        // Struktur |: Version(1) + UUID(16) + AddonsLen(1) + [Addons] + Command(1) + Port(2) + ATYP(1) + Address(...)
+        // Offset awal setelah UUID
+        let offset = 16;
+        const version = message.readUInt8(offset++); // Baca versi (biasanya 0 untuk |)
+        const addonsLen = message.readUInt8(offset++); // Panjang addons (biasanya 0)
+        offset += addonsLen; // Lewati addons jika ada
+
+        const command = message.readUInt8(offset++); // Command (biasanya 1 untuk TCP)
+        if (command !== 1) {
+             throw new Error(`Unsupported command: ${command}`);
+        }
+
+        // Dapatkan Host dan Port tujuan
+        const { ATYP, host: rawHost, port: targetPort, offset: newOffset } = parseHostInfo(message, offset);
+        let targetHost = rawHost;
+        offset = newOffset; // Update offset setelah parseHostInfo
+
+        // Resolve domain via DoH jika ATYP adalah Domain (ATYP=3)
+        if (ATYP === 3) { // Domain Name
+          try {
+            targetHost = await resolveHostViaDoH(rawHost);
+            // process.stdout.write(`DoH resolved ${rawHost} to ${targetHost}\n`);
+          } catch (err) {
+            process.stderr.write(`DoH resolution failed for ${rawHost}: ${err.message}. Closing connection.\n`);
+            ws.close(1011, "DNS resolution failed");
+            return;
+          }
+        }
+
+        // Kirim response ke client (misalnya | response: Version(1) + AddonsLen(1))
+        // Untuk |, respons biasanya [0x00, 0x00] jika tidak ada Addons
+        ws.send(Buffer.from([version, 0x00]));
+
+        // Buat koneksi TCP ke tujuan
+        remoteSocket = net.connect({
+          host: targetHost, // Gunakan IP hasil resolve jika domain
+          port: targetPort
+        }, () => {
+          // Koneksi TCP berhasil, siapkan piping
+          streamDuplex = WebSocket.createWebSocketStream(ws);
+          // Tulis sisa data dari paket pertama client (jika ada) ke remote socket
+          const remainingData = message.slice(offset);
+          if (remainingData.length > 0) {
+            remoteSocket.write(remainingData);
+          }
+          // Pipe data dua arah
+          streamDuplex.pipe(remoteSocket).pipe(streamDuplex);
+        });
+
+        // Error handling untuk koneksi TCP
+        remoteSocket.on('error', (err) => {
+          // process.stderr.write(`Remote socket error: ${err.message}. Closing WebSocket.\n`);
+          ws.close(1011, "Upstream connection error"); // Internal server error
+          remoteSocket.destroy();
+          if (streamDuplex) streamDuplex.destroy(err);
+        });
+
+        remoteSocket.on('end', () => {
+          // process.stdout.write('Remote socket ended connection.\n');
+          if (streamDuplex) streamDuplex.end(); // Tutup sisi tulis WebSocket stream
+        });
+
+        remoteSocket.on('close', (hadError) => {
+            // process.stdout.write(`Remote socket closed. Had error: ${hadError}\n`);
+            if (streamDuplex) streamDuplex.destroy();
+            ws.close(); // Pastikan WebSocket juga ditutup
+        });
+
+        // Error handling untuk stream WebSocket
+        streamDuplex.on('error', (err) => {
+        //   process.stderr.write(`WebSocket stream error: ${err.message}. Closing connections.\n`);
+          ws.close(1011, "WebSocket stream error");
+          if (remoteSocket) remoteSocket.destroy();
+          streamDuplex.destroy(err);
+        });
+
+
+      } else {
+        // Jika bukan pesan pertama dan koneksi remote sudah siap, teruskan data
+        if (remoteSocket && remoteSocket.writable && streamDuplex) {
+          // Data ini sudah otomatis di-pipe oleh streamDuplex.pipe(remoteSocket)
+          // Tidak perlu ws.send() atau remoteSocket.write() manual di sini lagi
+          // Cukup pastikan streamDuplex aktif
+        } else {
+            // Jika pesan datang sebelum remote siap atau setelah error
+            // process.stderr.write('Received WebSocket message, but upstream not ready or closed.\n');
+            // Pertimbangkan untuk menutup ws jika ini terjadi setelah setup gagal
+            // ws.close(1011, "Upstream not available");
+        }
+      }
+    } catch (err) {
+      process.stderr.write(`Error processing WebSocket message: ${err.message}\n`);
+      ws.close(1011, "Internal processing error"); // Internal server error
+      if (remoteSocket) remoteSocket.destroy();
+      if (streamDuplex) streamDuplex.destroy(err);
+    }
+  });
+
+  ws.on('close', (code, reason) => {
+    // process.stdout.write(`WebSocket connection closed. Code: ${code}, Reason: ${reason || 'No reason given'}\n`);
+    clearInterval(heartbeatInterval);
+    ws.isAlive = false;
+    if (remoteSocket) remoteSocket.destroy();
+    if (streamDuplex) streamDuplex.destroy();
   });
 
   ws.on('error', (err) => {
-    // console.error('WebSocket error:', err.message); // Kurangi log
+    // process.stderr.write(`WebSocket error: ${err.message}\n`);
+    clearInterval(heartbeatInterval);
+    ws.isAlive = false;
+    if (remoteSocket) remoteSocket.destroy();
+    if (streamDuplex) streamDuplex.destroy(err);
+    ws.close(1011, "WebSocket error occurred"); // Tutup jika belum tertutup
   });
 });
 
-// Middleware Basic Auth untuk endpoint HTTP GET
-app.use((req, res, next) => {
-    // Auth tidak berlaku untuk upgrade WebSocket, hanya untuk GET biasa
-    if (req.headers.upgrade && req.headers.upgrade.toLowerCase() === 'websocket') {
-        return next(); // Lewati auth untuk permintaan upgrade
-    }
-    const user = auth(req);
-    if (user && user.name === username && user.pass === password) {
-        return next();
-    }
-    res.set("WWW-Authenticate", 'Basic realm="Node Access"');
-    return res.status(401).send("Authentication required.");
-});
-
-// Handler untuk HTTP GET (misalnya untuk menampilkan link konfigurasi)
-app.get('*', (req, res) => {
-  const protocol = req.headers['x-forwarded-proto'] || req.protocol; // Handle proxy proto header
-  let host = req.headers['x-forwarded-host'] || req.get('host'); // Handle proxy host header
-  let portNum = host.includes(':') ? host.split(':')[1] : (protocol === 'https' ? 443 : 80);
-  if (host.includes(':')) {
-      [host] = host.split(':');
-  }
-
-  // Gunakan path yang divalidasi di server.on('upgrade')
-  const wsPath = expectedPath; // Path = /<uuid>
-
-  // Sesuaikan template link dengan protokol yang Anda gunakan (|/VMESS/Trojan/Pler?)
-  // Contoh ini menggunakan |, ganti '|' jika perlu
-  const link = protocol === 'https'
-    ? `|://${uuid}@${host}:${portNum}?path=${encodeURIComponent(wsPath)}&security=tls&encryption=none&host=${host}&type=ws&sni=${host}#Node-${port}`
-    : `|://${uuid}@${host}:${portNum}?path=${encodeURIComponent(wsPath)}&type=ws&encryption=none&host=${host}#Node-${port}`;
-
-  res.type('text/html');
-  res.send(`<!DOCTYPE html>
-<html>
-<head><title>Config</title></head>
-<body>
-  <p>Use this link in your client:</p>
-  <pre>${link}</pre>
-  <p>Make sure the 'path' in your client configuration is exactly: <code>${wsPath}</code></p>
-</body>
-</html>`);
-});
-
-// Tangani permintaan Upgrade WebSocket
+// Tangani permintaan upgrade WebSocket secara eksplisit
 server.on('upgrade', (request, socket, head) => {
-  let requestUrl;
-  try {
-      // Coba parse URL lengkap untuk mendapatkan pathname dengan aman
-      requestUrl = new URL(request.url, `ws://${request.headers.host}`);
-  } catch (e) {
-      console.error("Invalid request URL during upgrade:", request.url);
-      socket.destroy();
-      return;
-  }
-  const pathname = requestUrl.pathname;
-
-  // Validasi Path berdasarkan UUID
-  if (pathname !== expectedPath) {
-    // console.log(`UUID validation failed. Path mismatch. Expected: ${expectedPath}, Received: ${pathname}`); // Kurangi log
-    socket.destroy(); // Tolak koneksi jika path tidak cocok
+  // 1. Cek Basic Authentication
+  const user = auth(request);
+  if (!user || user.name !== username || user.pass !== password) {
+    // process.stderr.write('WebSocket upgrade failed: Basic Authentication failed.\n');
+    socket.write('HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm="Node"\r\n\r\n');
+    socket.destroy();
     return;
   }
 
-  // Jika path cocok, lanjutkan dengan upgrade WebSocket
+  // 2. Cek Path URL
+  const pathname = new URL(request.url, `http://${request.headers.host}`).pathname;
+  if (pathname !== WS_PATH) {
+    // process.stderr.write(`WebSocket upgrade failed: Path mismatch. Expected: ${WS_PATH}, Received: ${pathname}.\n`);
+    socket.write(`HTTP/1.1 400 Bad Request\r\n\r\n`);
+    socket.destroy();
+    return;
+  }
+
+  // 3. Jika Auth dan Path OK, serahkan ke WSS untuk menyelesaikan handshake
   wss.handleUpgrade(request, socket, head, (ws) => {
-    wss.emit('connection', ws, request); // Emit event 'connection' untuk ditangani oleh listener di atas
+    wss.emit('connection', ws, request);
   });
 });
 
-server.listen(port, () => {
-  // console.log(`Server running on port ${port}`); // Kurangi log
-  // console.log(`WebSocket connections expected on path: ${expectedPath}`); // Kurangi log
+// Middleware Basic Auth untuk rute HTTP biasa (jika diperlukan)
+// app.use((req, res, next) => {
+//   // Lewati jika permintaan upgrade WebSocket (sudah ditangani di server.on('upgrade'))
+//   if (req.headers.upgrade && req.headers.upgrade.toLowerCase() === 'websocket') {
+//       return next();
+//   }
+//   const user = auth(req);
+//   if (user && user.name === username && user.pass === password) {
+//     return next();
+//   }
+//   res.set("WWW-Authenticate", 'Basic realm="Node"');
+//   res.status(401).send("Authentication Required");
+// });
+
+// Rute HTTP untuk menampilkan link koneksi (tidak diautentikasi di sini)
+// Biasanya halaman ini tidak perlu auth, hanya koneksi WS yang perlu
+app.get('*', (req, res) => {
+    // Dapatkan host dan port dari header Host, tangani IPv6
+    const hostHeader = req.get('host') || '';
+    let detectedHost = hostHeader;
+    let detectedPort = server.address().port; // Ambil port aktual server berjalan
+
+    const ipv6Match = hostHeader.match(/\[(.*)\](?::(\d+))?$/); // Cocokkan [ipv6]:port
+    const ipv4Match = hostHeader.match(/([^:]+)(?::(\d+))?$/);  // Cocokkan ipv4:port atau domain:port
+
+    if (ipv6Match) {
+        detectedHost = ipv6Match[1]; // Alamat IPv6 tanpa kurung
+        if (ipv6Match[2]) {
+            detectedPort = parseInt(ipv6Match[2], 10); // Port jika ada
+        }
+    } else if (ipv4Match) {
+        detectedHost = ipv4Match[1]; // Alamat IPv4 atau domain
+        if (ipv4Match[2]) {
+            detectedPort = parseInt(ipv4Match[2], 10); // Port jika ada
+        }
+    }
+
+    // Tentukan protokol berdasarkan request (meskipun server ini hanya HTTP)
+    // Jika di belakang reverse proxy TLS, 'x-forwarded-proto' bisa digunakan
+    const protocol = req.get('x-forwarded-proto') === 'https' ? 'https' : req.protocol;
+    const isTls = protocol === 'https';
+
+    // Format link pler://
+    // Sesuaikan parameter query sesuai kebutuhan protokol pler Anda
+    let link = `pler://${V_UUID}@${detectedHost}:${detectedPort}?`;
+    link += `type=ws&path=${encodeURIComponent(WS_PATH)}&host=${encodeURIComponent(detectedHost)}`;
+    if (isTls) {
+        link += `&security=tls&sni=${encodeURIComponent(detectedHost)}`; // Tambahkan security=tls dan sni jika HTTPS
+    } else {
+        link += `&security=none`; // Atau sesuaikan jika ada parameter lain untuk non-TLS
+    }
+    link += `#node-pler`; // Fragment identifier
+
+    res.setHeader('Content-Type', 'text/html');
+    res.send(`<!DOCTYPE html><html><head><title>Connection Info</title></head><body><p>Scan or copy the link:</p><pre style="word-wrap: break-word; white-space: pre-wrap;">${link}</pre></body></html>`);
 });
 
-process.on('SIGTERM', () => {
-    server.close(() => { process.exit(0); });
+
+server.listen(port, '0.0.0.0', () => { // Dengarkan di semua interface
+  process.stdout.write(`Server running on port ${port}, WebSocket Path: ${WS_PATH}\n`);
+  process.stdout.write(`Expected UUID: ${V_UUID}\n`);
 });
+
+// Tangani sinyal shutdown
 process.on('SIGINT', () => {
-    server.close(() => { process.exit(0); });
+    process.stdout.write("\nGracefully shutting down...\n");
+    wss.close(() => {
+        server.close(() => {
+            process.stdout.write("Server closed.\n");
+            process.exit(0);
+        });
+    });
+    // Beri waktu sedikit untuk koneksi aktif selesai
+    setTimeout(() => {
+        process.stderr.write("Shutdown timeout, forcing exit.\n");
+        process.exit(1);
+    }, 5000); // 5 detik timeout
 });
